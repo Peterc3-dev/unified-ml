@@ -99,11 +99,14 @@ Proof of concept -- demonstrating the unified memory advantage for ML inference 
 - [x] Custom attention kernel for gfx1150
 - [x] Correctness verification (GPU vs CPU reference)
 - [x] Python benchmark wrapper
+- [x] Vulkan compute backend (Kompute)
+- [x] Vulkan vs HIP benchmark comparison
 - [ ] Full transformer inference engine
 - [ ] Model loading (GGUF / safetensors)
 - [ ] FP16/BF16 kernels
 - [ ] KV cache management
-- [ ] XDNA NPU integration
+- [x] NPU proof of life (amdxdna driver + /dev/accel/accel0)
+- [ ] XDNA NPU integration (IREE runtime)
 - [ ] Python inference API
 
 ## License
