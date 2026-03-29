@@ -6,10 +6,35 @@
 **CPU:** AMD Ryzen AI 9 HX 370 (Strix Halo)
 **BIOS:** American Megatrends v2.10
 
-## Current Status: BLOCKED — SMU Power-On Failure
+## Current Status: WORKING (patched driver, no power management)
 
-The NPU hardware is present and enumerated, but the kernel driver cannot initialize
-the SMU (System Management Unit), which prevents all NPU operations.
+The NPU is fully operational using a patched out-of-tree amdxdna driver that
+bypasses the non-functional SMU. FLM validates `ready: true`, inference runs.
+
+### NPU Inference Benchmarks (Llama 3.2 1B via FLM)
+
+| Metric | Value |
+|--------|-------|
+| Prefill speed | 40-46 tok/s |
+| Decode speed | 14-24 tok/s |
+| Haiku generation (14 tokens) | 1.68s wall clock |
+| FLM validate | `ready: true`, 8 cols, FW 1.1.2.64 |
+
+### Auto-load on Boot
+
+The patched driver loads automatically via `npu-loader.service` (systemd).
+It replaces the in-tree driver which fails on SMU init.
+
+### The Fix
+
+The SMU (System Management Unit) on Strix Halo is non-functional — it never
+responds to commands regardless of firmware state. The fix: skip SMU init
+entirely when PSP successfully loads firmware. The NPU runs without power
+management (DPM/clock gating), using default clock speeds set by the BIOS.
+
+Patch location: `~/builds/xrt-plugin/xdna-driver/drivers/accel/amdxdna/aie2_pci.c`
+
+### The Original Error (for reference)
 
 ### The Error
 
