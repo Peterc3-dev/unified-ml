@@ -1,83 +1,221 @@
-# NPU Proof of Life - GPD Pocket 4
+# NPU Status — GPD Pocket 4 (Strix Halo)
 
-**Date:** 2026-03-29
+**Last Updated:** 2026-03-29
 **Host:** GPD Pocket 4 (Tailscale 100.77.212.27)
 **OS:** CachyOS (rolling), kernel 6.19.10-1-cachyos
 **CPU:** AMD Ryzen AI 9 HX 370 (Strix Halo)
+**BIOS:** American Megatrends v2.10
 
-## Device Status: ALIVE
+## Current Status: BLOCKED — SMU Power-On Failure
 
-### Device Node
+The NPU hardware is present and enumerated, but the kernel driver cannot initialize
+the SMU (System Management Unit), which prevents all NPU operations.
+
+### The Error
+
 ```
-crw-rw-rw- 1 root render 261, 0 Mar 28 07:57 /dev/accel/accel0
+amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_smu_exec: smu cmd 4 failed, 0xff
+amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_smu_init: Access power failed, ret -22
+amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_hw_start: failed to init smu, ret -22
+amdxdna 0000:c6:00.1: [drm] *ERROR* aie2_hw_resume: Start hardware failed, -22
 ```
-- Permissions: 0666 (world read/write) -- no sudo needed for access
-- User `raz` is in the `render` group (gid 988)
+
+- **SMU cmd 4** = `AIE_SMU_POWER_OFF` (0x4) — the driver sends POWER_OFF first to
+  ensure a clean state, then POWER_ON. The POWER_OFF command itself fails.
+- **0xff response** = SMU response register holds 0xFF (not `SMU_RESULT_OK` = 1).
+  This means the SMU firmware is not running and the register holds a stale value.
+- After PCI reset, the error changes to **timeout** (-110/ETIMEDOUT) because the
+  reset clears the stale register value, and the SMU never writes a new response.
+
+### Root Cause Analysis
+
+**The NPU's SMU does not respond because the NPU firmware hasn't been loaded yet.**
+
+The init sequence in `aie2_hw_start()` is:
+1. `aie_smu_init()` — tries POWER_OFF + POWER_ON ← **FAILS HERE**
+2. `aie_psp_start()` — loads firmware via PSP (Platform Security Processor)
+3. `aie2_get_mgmt_chann_info()` — checks firmware is alive
+4. Management firmware init, power management, etc.
+
+On Strix Halo, the NPU's SMU is part of the NPU firmware (loaded by PSP), not a
+standalone hardware component pre-initialized by the BIOS. The driver's init order
+assumes the SMU is already running when the driver loads — this is wrong for Strix Halo.
+
+**Evidence:**
+- Direct BAR register reads confirm: SMU registers are accessible but the SMU
+  never processes commands (CMD register holds the last written value, RESP stays 0)
+- PSP is alive and responsive (`PSP_STATUS_READY` bit set in MP0_C2PMSG_123)
+- PSP `RELEASE_TMR` command succeeds when sent directly via MMIO
+- The BIOS does NOT pre-initialize the NPU's SMU for this hardware revision
 
 ### Hardware Identity
+
 ```
-PCI ID:     1022:17F0
+PCI ID:     1022:17F0 rev 0x10
 PCI Slot:   0000:c6:00.1
-Driver:     amdxdna
-Device:     RyzenAI-npu4
-Firmware:   1.0.0.63
-Revision:   0x10
-lspci:      Signal processing controller: AMD Strix/Krackan/Strix Halo Neural Processing Unit (rev 10)
+IOMMU:      Group 25
+NPU Type:   RyzenAI-npu4 (XDNA 2, aie2p architecture)
+Capability: 50 TOPS INT8
+BARs:
+  BAR 0: [mem 0xdca00000-0xdcafffff] 1MB   — NPU registers + mailbox
+  BAR 1: [mem 0xdcb00000-0xdcb01fff] 8K
+  BAR 2: [mem 0x7810000000-0x781007ffff] 512K pref — SRAM
+  BAR 4: [mem 0xdcb02000-0xdcb02fff] 4K    — PSP (Platform Security Processor)
+  BAR 5: [mem 0xdcb03000-0xdcb03fff] 4K    — SMU (System Management Unit)
 ```
+
+### SMU Register Dump (BAR 5)
+
+```
+SMU_CMD  (MP1_C2PMSG_0)  [0x900]: 0x00000004  ← POWER_OFF command (stale)
+SMU_ARG  (MP1_C2PMSG_60) [0x9F0]: 0x00000000
+SMU_RESP (MP1_C2PMSG_61) [0x9F4]: 0x00000000  ← No response (SMU not running)
+SMU_INTR (APERTURE4_BASE)[0x000]: 0xFFFFFFFF  ← Interrupt reg (default/invalid)
+```
+
+### PSP Register State (BAR 4 + BAR 0)
+
+```
+PSP_STATUS (MP0_C2PMSG_123) [BAR4:0xAEC]: 0x80000000  ← READY bit set
+PSP_INTR   (MP0_C2PMSG_73)  [BAR4:0xA24]: 0x00000001
+SCRATCH3   (PSP_RESP)       [BAR0:0x10078]: 0xFFFF0007  ← PSP_ERROR_BAD_STATE
+```
+
+PSP is powered and responsive but returned BAD_STATE from a previous operation.
+
+## Installed Software
 
 ### Kernel Driver
-- `CONFIG_DRM_ACCEL_AMDXDNA=m` -- built as module in kernel config
-- Module loaded and active:
-  ```
-  amdxdna               200704  1
-  gpu_sched              73728  2 amdxdna,amdgpu
-  ```
-- The amdxdna module has 1 active reference (the NPU device)
-- It shares gpu_sched with amdgpu (the Radeon 890M iGPU)
 
-### Python Environment
-- System Python: 3.14.3
-- Python 3.12 available at `/usr/bin/python3.12`
-- Python 3.11 available at `/usr/bin/python3.11`
-- Venv created: `~/npu-venv` (python3.12)
+| Component | Version | Status |
+|-----------|---------|--------|
+| amdxdna.ko (in-tree) | kernel 6.19.10-1-cachyos | Loads, probe fails on SMU |
+| amdxdna.ko (out-of-tree, patched) | from xdna-driver repo | Built, needs reboot to test |
 
-### IREE Runtime
-- **Installed:** iree-compiler 20241104.1068, iree-runtime 20241104.1068
-- **Available HAL drivers:** cuda, hip, local-sync, local-task, vulkan
-- **Note:** No dedicated XDNA/NPU HAL driver in this IREE release. The NPU requires either:
-  - IREE built from source with XDNA support (iree-amd-aie project)
-  - XRT (Xilinx Runtime) + mlir-aie toolchain
-  - AMD's RyzenAI Software stack
+### XRT Stack
 
-### mlir_aie
-- **Not available on PyPI** -- must be built from source via https://github.com/Xilinx/mlir-aie
-- Expected: this is a source-only distribution
+| Package | Version |
+|---------|---------|
+| xrt | 2.21.75-5.1 |
+| xrt-plugin-amdxdna | 2.21.75-2.1 |
 
-### XRT (Xilinx Runtime)
-- **Not installed** (no /opt/xilinx, no xbutil/xrt-smi found in initial checks)
-- Required for userspace NPU access beyond the raw /dev/accel device
-- For Strix Halo (NPU4), the xdna-driver project provides the userspace stack
+### FastFlowLM (FLM)
 
-## Summary
+| Component | Details |
+|-----------|---------|
+| Version | 0.9.37 |
+| Binary | /usr/bin/flm |
+| xclbin kernels | 38 model directories at /usr/share/flm/xclbins/ |
+| Installed models | llama3.2:1b (Llama-3.2-1B) |
+| Available models | 19 total (deepseek-r1:8b, gemma3, phi4-mini, qwen2.5, etc.) |
 
-| Component | Status |
-|-----------|--------|
-| NPU hardware | Present (PCI 1022:17F0) |
-| Kernel driver (amdxdna) | Loaded, active, 1 ref |
-| Device node (/dev/accel/accel0) | Exists, world-accessible |
-| NPU firmware | v1.0.0.63 loaded |
-| User permissions | OK (render group + 0666 perms) |
-| Python 3.12 venv | Created at ~/npu-venv |
-| IREE runtime | Installed (no XDNA HAL driver) |
-| XRT userspace | NOT installed |
-| mlir-aie | NOT installed (source-only) |
+### NPU Firmware
 
-## Next Steps
+| File | Size | Protocol |
+|------|------|----------|
+| npu.sbin.1.0.0.63.zst | 72 KB | Older |
+| npu.sbin.1.1.2.64.zst | 125 KB | Newer |
+| npu.sbin.zst (active) | → npu.sbin.1.1.2.64.zst | Symlink |
+| npu_7.sbin.zst | → npu.sbin.1.1.2.64.zst | Protocol 7 symlink |
+| npu.dev.sbin | NOT PRESENT | Development firmware |
 
-1. **Install XRT/xdna-driver** -- The xdna-driver userspace stack is needed to talk to the NPU from applications. Repo: https://github.com/amd/xdna-driver -- requires building from source on Arch-based distros (no .deb/.rpm).
+Path: `/lib/firmware/amdnpu/17f0_10/`
 
-2. **Build IREE with XDNA support** -- The iree-amd-aie project (https://github.com/nod-ai/iree-amd-aie) adds an XDNA HAL driver to IREE, enabling compilation and execution of ML models on the NPU.
+### IREE
 
-3. **Alternative: AMD RyzenAI Software** -- AMD provides a RyzenAI SDK with Vitis AI / ONNX Runtime EP for the NPU. This is the most turnkey path but targets Ubuntu officially.
+- Installed in ~/npu-venv (Python 3.12)
+- Version: iree-compiler 20241104.1068, iree-runtime 20241104.1068
+- HAL drivers: cuda, hip, local-sync, local-task, vulkan
+- No XDNA HAL driver (requires iree-amd-aie built from source)
 
-4. **Quick validation** -- Once XRT is installed, `xbutil examine` should show the NPU device details and confirm the full userspace stack works.
+## IREE Benchmark Results
+
+| Backend | Matrix Size | GFLOPS | Notes |
+|---------|------------|--------|-------|
+| CPU (local-task) | 1024x1024 | 27.4 | Multi-threaded |
+| Vulkan (Radeon 890M) | 1024x1024 | 1,084.8 | RDNA 3 iGPU |
+| NPU | — | — | Blocked (SMU failure) |
+
+## What Was Tried
+
+### Path A: Kernel 7.0+
+- No kernel 7.0+ available in CachyOS repos (latest: 6.19.10)
+- LTS kernel 6.18.20-1-cachyos-lts has amdxdna.ko (untested)
+
+### Path B: PCI Device Reset
+- `echo 1 > /sys/bus/pci/devices/0000:c6:00.1/reset` + module reload
+- Result: Error changed from 0xff to **timeout** (worse — SMU completely unresponsive)
+
+### Path C: Alternative Firmware
+- Tried older firmware (npu.sbin.1.0.0.63.zst) — same timeout error
+- Both firmware versions fail identically → not a firmware protocol issue
+
+### Path D: PCI Remove + Rescan
+- Removed NPU device from PCI bus and rescanned
+- Result: Device re-enumerated correctly, same SMU timeout
+- Side effect: GPU's SMU got stuck ("I'm not done with previous command") — caused display blackout
+
+### Path E: Out-of-Tree Driver Build (PATCHED)
+- Built from ~/builds/xrt-plugin/xdna-driver/ with init-order fix
+- **Patch**: If SMU init fails in `aie2_hw_start()`, load firmware via PSP first, then retry SMU
+- Build succeeded, patch triggered correctly ("SMU init failed, loading FW first")
+- PSP timed out because register manipulation from Path D corrupted PSP state
+- **Needs clean reboot to test properly**
+
+### Path F: Direct PSP Communication
+- Read PSP registers directly: PSP_STATUS_READY = true
+- Sent PSP_RELEASE_TMR command via MMIO: succeeded (response = 0)
+- Side effect: Released trusted memory region, crashed GPU display pipeline
+- **Do NOT do this again** — direct PSP manipulation is dangerous on shared SoC
+
+## The Fix (Pending Reboot Test)
+
+Patched out-of-tree driver at:
+```
+~/builds/xrt-plugin/xdna-driver/drivers/accel/amdxdna/amdxdna.ko
+```
+
+Test script:
+```bash
+bash ~/builds/xrt-plugin/xdna-driver/test-patched-driver.sh
+```
+
+The patch modifies `aie2_hw_start()` in `aie2_pci.c`:
+```c
+// Original: SMU → PSP → FW alive
+// Patched:  SMU → if fail → PSP → retry SMU → FW alive
+ret = aie_smu_init(ndev->aie.smu_hdl);
+if (ret) {
+    XDNA_INFO(xdna, "SMU init failed (ret %d), loading FW first", ret);
+    ret = aie_psp_start(ndev->aie.psp_hdl);
+    if (ret) goto cleanup;
+    ret = aie_smu_init(ndev->aie.smu_hdl);
+    if (ret) goto cleanup;
+} else {
+    ret = aie_psp_start(ndev->aie.psp_hdl);
+    if (ret) goto cleanup;
+}
+```
+
+## If the Patch Doesn't Work
+
+If SMU still doesn't respond after PSP loads firmware:
+
+1. **Check BIOS settings**: NPU/IPU must be enabled, GPU mode set to "hybrid".
+   Users have reported fixing identical SMU errors by changing BIOS GPU settings.
+
+2. **Try npu.dev.sbin**: The development firmware from AMD's `drm-firmware` repo
+   (`amd-ipu-staging` branch) may have different initialization behavior.
+
+3. **Upstream kernel**: Kernel 7.0-rc2+ may have updated Strix Halo SMU support
+   (per AMD Lemonade documentation).
+
+4. **Skip SMU entirely**: If PSP loads firmware and FW_ALIVE is set, the driver
+   could potentially operate without SMU power management (degraded mode).
+
+## Available Kernel Modules
+
+```
+/lib/modules/6.19.10-1-cachyos/kernel/drivers/accel/amdxdna/amdxdna.ko.zst
+/lib/modules/6.18.20-1-cachyos-lts/kernel/drivers/accel/amdxdna/amdxdna.ko.zst
+```
