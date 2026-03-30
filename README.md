@@ -50,6 +50,19 @@ See [docs/architecture.md](docs/architecture.md) for the full technical design.
 
 ## Benchmarks
 
+### Vulkan compute (IREE)
+
+| Backend | GFLOPS | Notes |
+|---------|--------|-------|
+| **Vulkan (IREE)** | **1,084.8** | Full VRAM + GTT access via `VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT` |
+| ROCm (HIP) | ~680 | Limited to BIOS VRAM carveout (`hipMallocManaged` broken on gfx1150) |
+
+**Vulkan outperforms ROCm by ~60% on the Radeon 890M** because Vulkan correctly addresses both VRAM and GTT memory (80+ GB total on a 32 GB system), while ROCm's `hipMallocManaged` is broken on gfx1150 and sees only the BIOS-configured VRAM carveout.
+
+These kernels are used by [R.A.G-Race-Router](https://github.com/Peterc3-dev/rag-race-router), the tri-processor inference runtime that routes GPU work through Vulkan instead of ROCm.
+
+### Memory strategy comparison
+
 The PoC benchmark compares three memory strategies on the same matmul kernel:
 
 | Strategy | Description | Copy Overhead |
