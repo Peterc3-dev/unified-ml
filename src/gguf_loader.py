@@ -2,7 +2,7 @@
 gguf_loader.py — Zero-copy GGUF model loader for unified-ml.
 
 Parses GGUF file headers, memory-maps tensor data, and dequantizes
-common formats (F32, F16, Q4_0, Q8_0) to float32 numpy arrays.
+common formats (F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K) to float32 numpy arrays.
 
 No external GGUF libraries — just struct + mmap + numpy.
 """
@@ -36,6 +36,9 @@ GGML_TYPE_F32  = 0
 GGML_TYPE_F16  = 1
 GGML_TYPE_Q4_0 = 2
 GGML_TYPE_Q8_0 = 8
+GGML_TYPE_Q4_K = 12
+GGML_TYPE_Q5_K = 13
+GGML_TYPE_Q6_K = 14
 
 # Block sizes and byte sizes for quantized types
 # Q4_0: 32 elements per block, 2 bytes scale + 16 bytes quants = 18 bytes/block
@@ -45,6 +48,9 @@ QUANT_INFO = {
     GGML_TYPE_F16:  {"name": "F16",  "block_size": 1,  "type_size": 2},
     GGML_TYPE_Q4_0: {"name": "Q4_0", "block_size": 32, "type_size": 18},
     GGML_TYPE_Q8_0: {"name": "Q8_0", "block_size": 32, "type_size": 34},
+    GGML_TYPE_Q4_K: {"name": "Q4_K", "block_size": 256, "type_size": 144},
+    GGML_TYPE_Q5_K: {"name": "Q5_K", "block_size": 256, "type_size": 176},
+    GGML_TYPE_Q6_K: {"name": "Q6_K", "block_size": 256, "type_size": 210},
 }
 
 # Extended type names for display
@@ -61,7 +67,7 @@ class GGUFLoader:
     Memory-mapped GGUF model loader.
 
     Parses headers and tensor metadata, then provides zero-copy access
-    to tensor data via mmap. Dequantizes Q4_0/Q8_0 to float32 on demand.
+    to tensor data via mmap. Dequantizes Q4_0/Q8_0/Q4_K/Q5_K/Q6_K to float32 on demand.
     """
 
     def __init__(self, path: str):
@@ -303,6 +309,201 @@ class GGUFLoader:
         result = qbytes * scales[:, np.newaxis]
         return result.flatten()[:n_elements]
 
+    # ── K-quant dequantization ────────────────────────────────────
+
+    @staticmethod
+    def _dequant_q4_k(data: bytes, n_elements: int) -> np.ndarray:
+        """
+        Vectorized Q4_K dequantization.
+
+        Super-block layout (144 bytes, 256 values):
+          - 2 bytes: f16 super-scale (d)
+          - 2 bytes: f16 super-min (dmin)
+          - 12 bytes: 6-bit packed scales/mins for 8 sub-blocks
+          - 128 bytes: 4-bit quantized values (2 values per byte)
+
+        Each super-block has 8 sub-blocks of 32 values.
+        """
+        block_size = 256
+        bytes_per_block = 144
+        n_blocks = n_elements // block_size
+
+        raw = np.frombuffer(data[:n_blocks * bytes_per_block], dtype=np.uint8)
+        raw = raw.reshape(n_blocks, bytes_per_block)
+
+        # Super-scale d and dmin (f16)
+        d = raw[:, 0:2].copy().view(np.float16).astype(np.float32).flatten()
+        dmin = raw[:, 2:4].copy().view(np.float16).astype(np.float32).flatten()
+
+        # 12 bytes of packed 6-bit scales/mins
+        sc = raw[:, 4:16].astype(np.int32)
+
+        sub_scales = np.empty((n_blocks, 8), dtype=np.float32)
+        sub_mins = np.empty((n_blocks, 8), dtype=np.float32)
+
+        # Sub-blocks 0-3: direct 6-bit values
+        for j in range(4):
+            sub_scales[:, j] = d * (sc[:, j] & 63)
+            sub_mins[:, j] = dmin * (sc[:, j + 4] & 63)
+
+        # Sub-blocks 4-7: combined from two sources
+        for j in range(4, 8):
+            sub_scales[:, j] = d * ((sc[:, j + 4] & 0xF) | ((sc[:, j - 4] >> 6) << 4))
+            sub_mins[:, j] = dmin * ((sc[:, j + 4] >> 4) | ((sc[:, j] >> 6) << 4))
+
+        # 128 bytes of 4-bit quantized values
+        qbytes = raw[:, 16:]  # (n_blocks, 128)
+
+        result = np.empty((n_blocks, block_size), dtype=np.float32)
+
+        for j in range(8):
+            qb = qbytes[:, j * 16:(j + 1) * 16]  # (n_blocks, 16)
+            lo = (qb & 0xF).astype(np.float32)
+            hi = ((qb >> 4) & 0xF).astype(np.float32)
+
+            sd = sub_scales[:, j:j + 1]  # (n_blocks, 1)
+            sm = sub_mins[:, j:j + 1]
+
+            result[:, j * 32:j * 32 + 16] = lo * sd - sm
+            result[:, j * 32 + 16:j * 32 + 32] = hi * sd - sm
+
+        return result.flatten()[:n_elements]
+
+    @staticmethod
+    def _dequant_q5_k(data: bytes, n_elements: int) -> np.ndarray:
+        """
+        Vectorized Q5_K dequantization.
+
+        Super-block layout (176 bytes, 256 values):
+          - 2 bytes: f16 super-scale (d)
+          - 2 bytes: f16 super-min (dmin)
+          - 12 bytes: 6-bit packed scales/mins for 8 sub-blocks
+          - 128 bytes: low 4-bit quantized values
+          - 32 bytes: high bits (bit 4 of each quant value)
+
+        5-bit quant = low 4 bits + 1 high bit.
+        """
+        block_size = 256
+        bytes_per_block = 176
+        n_blocks = n_elements // block_size
+
+        raw = np.frombuffer(data[:n_blocks * bytes_per_block], dtype=np.uint8)
+        raw = raw.reshape(n_blocks, bytes_per_block)
+
+        # Super-scale d and dmin (f16)
+        d = raw[:, 0:2].copy().view(np.float16).astype(np.float32).flatten()
+        dmin = raw[:, 2:4].copy().view(np.float16).astype(np.float32).flatten()
+
+        # 12 bytes of packed 6-bit scales/mins (same format as Q4_K)
+        sc = raw[:, 4:16].astype(np.int32)
+
+        sub_scales = np.empty((n_blocks, 8), dtype=np.float32)
+        sub_mins = np.empty((n_blocks, 8), dtype=np.float32)
+
+        for j in range(4):
+            sub_scales[:, j] = d * (sc[:, j] & 63)
+            sub_mins[:, j] = dmin * (sc[:, j + 4] & 63)
+
+        for j in range(4, 8):
+            sub_scales[:, j] = d * ((sc[:, j + 4] & 0xF) | ((sc[:, j - 4] >> 6) << 4))
+            sub_mins[:, j] = dmin * ((sc[:, j + 4] >> 4) | ((sc[:, j] >> 6) << 4))
+
+        # 128 bytes of low 4-bit quants
+        ql = raw[:, 16:144]  # (n_blocks, 128)
+
+        # 32 bytes of high bits — bit j of byte[j//8] is the high bit of element j
+        qh = raw[:, 144:176]  # (n_blocks, 32)
+
+        result = np.empty((n_blocks, block_size), dtype=np.float32)
+
+        for j in range(8):
+            qb = ql[:, j * 16:(j + 1) * 16]  # (n_blocks, 16)
+            lo = (qb & 0xF).astype(np.int32)
+            hi = ((qb >> 4) & 0xF).astype(np.int32)
+
+            for k in range(16):
+                elem_lo = j * 32 + k
+                elem_hi = j * 32 + k + 16
+                byte_lo = elem_lo // 8
+                bit_lo = elem_lo % 8
+                byte_hi = elem_hi // 8
+                bit_hi = elem_hi % 8
+
+                hb_lo = ((qh[:, byte_lo] >> bit_lo) & 1).astype(np.int32)
+                hb_hi = ((qh[:, byte_hi] >> bit_hi) & 1).astype(np.int32)
+
+                q_lo = lo[:, k] | (hb_lo << 4)
+                q_hi = hi[:, k] | (hb_hi << 4)
+
+                sd = sub_scales[:, j]
+                sm = sub_mins[:, j]
+
+                result[:, j * 32 + k] = sd * q_lo.astype(np.float32) - sm
+                result[:, j * 32 + k + 16] = sd * q_hi.astype(np.float32) - sm
+
+        return result.flatten()[:n_elements]
+
+    @staticmethod
+    def _dequant_q6_k(data: bytes, n_elements: int) -> np.ndarray:
+        """
+        Vectorized Q6_K dequantization.
+
+        Super-block layout (210 bytes, 256 values):
+          - 128 bytes: low 4-bit quantized values (ql)
+          - 64 bytes: high 2-bit values (qh)
+          - 16 bytes: int8 sub-block scales
+          - 2 bytes: f16 super-scale (d)
+
+        6-bit quant = low 4 bits from ql + high 2 bits from qh.
+        Values: scale[sub] * d * (q - 32).
+        """
+        block_size = 256
+        bytes_per_block = 210
+        n_blocks = n_elements // block_size
+
+        raw = np.frombuffer(data[:n_blocks * bytes_per_block], dtype=np.uint8)
+        raw = raw.reshape(n_blocks, bytes_per_block)
+
+        # Layout: ql(128) + qh(64) + scales(16) + d(2) = 210
+        ql = raw[:, 0:128]
+        qh = raw[:, 128:192]
+        sc = raw[:, 192:208].view(np.int8).astype(np.float32)  # 16 int8 scales
+        d = raw[:, 208:210].copy().view(np.float16).astype(np.float32).flatten()
+
+        result = np.empty((n_blocks, block_size), dtype=np.float32)
+
+        # Process in 2 halves of 128 elements, each reading 64 ql bytes + 32 qh bytes
+        for n_off in range(2):
+            n = n_off * 128
+            ql_base = n_off * 64
+            qh_base = n_off * 32
+
+            ql_a = ql[:, ql_base:ql_base + 32]        # (n_blocks, 32)
+            ql_b = ql[:, ql_base + 32:ql_base + 64]    # (n_blocks, 32)
+            qh_c = qh[:, qh_base:qh_base + 32]         # (n_blocks, 32)
+
+            # 4 groups of 32 values: combine low nibble/high nibble with 2-bit high
+            q1 = (ql_a & 0xF).astype(np.int32) | (((qh_c >> 0) & 3).astype(np.int32) << 4)
+            q2 = (ql_b & 0xF).astype(np.int32) | (((qh_c >> 2) & 3).astype(np.int32) << 4)
+            q3 = ((ql_a >> 4) & 0xF).astype(np.int32) | (((qh_c >> 4) & 3).astype(np.int32) << 4)
+            q4 = ((ql_b >> 4) & 0xF).astype(np.int32) | (((qh_c >> 6) & 3).astype(np.int32) << 4)
+
+            is_base = n // 16  # 0 for first half, 8 for second half
+
+            for q_vals, q_offset, sc_off in [
+                (q1, 0, 0), (q2, 32, 2), (q3, 64, 4), (q4, 96, 6)
+            ]:
+                s_a = sc[:, is_base + sc_off] * d       # (n_blocks,)
+                s_b = sc[:, is_base + sc_off + 1] * d   # (n_blocks,)
+
+                vals_a = q_vals[:, :16].astype(np.float32) - 32.0
+                vals_b = q_vals[:, 16:].astype(np.float32) - 32.0
+
+                result[:, n + q_offset:n + q_offset + 16] = vals_a * s_a[:, np.newaxis]
+                result[:, n + q_offset + 16:n + q_offset + 32] = vals_b * s_b[:, np.newaxis]
+
+        return result.flatten()[:n_elements]
+
     # ── Public API ─────────────────────────────────────────────────
 
     def print_metadata(self):
@@ -387,7 +588,7 @@ class GGUFLoader:
         Load and dequantize a single tensor by name.
 
         Returns a float32 numpy array. For F32/F16, this is a view or
-        simple cast. For Q4_0/Q8_0, dequantization is performed.
+        simple cast. For quantized types, dequantization is performed.
         """
         info = None
         for ti in self.tensor_infos:
@@ -406,7 +607,7 @@ class GGUFLoader:
         if qinfo is None:
             raise ValueError(
                 f"Unsupported tensor type: {info['type_name']} (id={dtype}) "
-                f"for tensor {name!r}. Supported: F32, F16, Q4_0, Q8_0"
+                f"for tensor {name!r}. Supported: F32, F16, Q4_0, Q8_0, Q4_K, Q5_K, Q6_K"
             )
 
         # Calculate byte size
@@ -426,6 +627,12 @@ class GGUFLoader:
             arr = self._dequant_q4_0_fast(raw, n_elements)
         elif dtype == GGML_TYPE_Q8_0:
             arr = self._dequant_q8_0(raw, n_elements)
+        elif dtype == GGML_TYPE_Q4_K:
+            arr = self._dequant_q4_k(raw, n_elements)
+        elif dtype == GGML_TYPE_Q5_K:
+            arr = self._dequant_q5_k(raw, n_elements)
+        elif dtype == GGML_TYPE_Q6_K:
+            arr = self._dequant_q6_k(raw, n_elements)
         else:
             raise ValueError(f"No dequantizer for type {dtype}")
 
