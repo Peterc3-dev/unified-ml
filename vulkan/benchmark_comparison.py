@@ -1,7 +1,7 @@
 """HIP vs Vulkan vs NumPy comparison benchmark for unified-ml.
 
 Runs matmul and memory bandwidth tests across backends and outputs results.
-Requires: Kompute (in musicgen venv), numpy
+Requires: Kompute (the `kp` Python module), numpy
 """
 import json
 import struct
