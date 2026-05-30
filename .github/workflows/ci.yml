@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install lint + test deps
+        # Only lightweight deps. The heavy/optional backends (torch, kompute,
+        # ROCm/HIP, model weights) are deliberately NOT installed — CI exercises
+        # pure logic only and must stay green without a GPU.
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest numpy
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Pytest (pure-logic unit tests)
+        # Scoped to tests/, which avoid any heavy-dependency import.
+        run: pytest -q tests

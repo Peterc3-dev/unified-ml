@@ -11,7 +11,7 @@ import struct
 import mmap
 import numpy as np
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Tuple, Any
 
 # GGUF magic number: ASCII "GGUF"
 GGUF_MAGIC = 0x46554747  # little-endian "GGUF"
@@ -94,12 +94,18 @@ class GGUFLoader:
         self._compute_data_offset()
 
     def close(self):
-        """Release mmap and file handle."""
-        if self._mm:
-            self._mm.close()
+        """Release mmap and file handle.
+
+        Tolerant of partial construction: if ``__init__`` raised before the
+        mmap/file attributes were set, there is nothing to release.
+        """
+        mm = getattr(self, "_mm", None)
+        if mm is not None:
+            mm.close()
             self._mm = None
-        if self._fp:
-            self._fp.close()
+        fp = getattr(self, "_fp", None)
+        if fp is not None:
+            fp.close()
             self._fp = None
 
     def __enter__(self):

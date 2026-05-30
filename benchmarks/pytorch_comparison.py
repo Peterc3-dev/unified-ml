@@ -9,9 +9,9 @@ This script runs:
 Requires: torch (with ROCm), unified-ml binaries built
 """
 
+import importlib.util
 import subprocess
 import time
-import sys
 from pathlib import Path
 
 UNIFIED_ML_ROOT = Path(__file__).resolve().parent.parent
@@ -19,12 +19,8 @@ BUILD_DIR = UNIFIED_ML_ROOT / "build"
 
 
 def pytorch_available() -> bool:
-    """Check if PyTorch is available."""
-    try:
-        import torch
-        return True
-    except ImportError:
-        return False
+    """Check if PyTorch is available without importing it."""
+    return importlib.util.find_spec("torch") is not None
 
 
 def pytorch_matmul_benchmark(N: int, iterations: int = 20, warmup: int = 5) -> float:
@@ -42,14 +38,14 @@ def pytorch_matmul_benchmark(N: int, iterations: int = 20, warmup: int = 5) -> f
 
     # Warmup
     for _ in range(warmup):
-        C = torch.mm(A, B)
+        torch.mm(A, B)
     if device == "cuda":
         torch.cuda.synchronize()
 
     # Timed
     start = time.perf_counter()
     for _ in range(iterations):
-        C = torch.mm(A, B)
+        torch.mm(A, B)
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
@@ -77,14 +73,14 @@ def pytorch_attention_benchmark(seq_len: int, head_dim: int, num_heads: int = 1,
 
     # Warmup
     for _ in range(warmup):
-        out = F.scaled_dot_product_attention(Q, K, V)
+        F.scaled_dot_product_attention(Q, K, V)
     if device == "cuda":
         torch.cuda.synchronize()
 
     # Timed
     start = time.perf_counter()
     for _ in range(iterations):
-        out = F.scaled_dot_product_attention(Q, K, V)
+        F.scaled_dot_product_attention(Q, K, V)
     if device == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - start

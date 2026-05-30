@@ -1,7 +1,7 @@
 # NPU Status — GPD Pocket 4 (Strix Halo)
 
 **Last Updated:** 2026-03-29
-**Host:** GPD Pocket 4 (Tailscale 100.77.212.27)
+**Host:** GPD Pocket 4 (Strix Point APU node)
 **OS:** CachyOS (rolling), kernel 6.19.10-1-cachyos
 **CPU:** AMD Ryzen AI 9 HX 370 (Strix Halo)
 **BIOS:** American Megatrends v2.10

@@ -1,0 +1,38 @@
+[project]
+name = "unified-ml"
+version = "0.1.0"
+description = "Custom ML inference engine optimized for AMD APU unified memory (RDNA 3.5 / gfx1150)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Backend-specific extras. Install the torch build that matches your GPU
+# (ROCm/CUDA) — the index URL is not pinned here on purpose.
+torch = ["torch"]
+vulkan = ["kp"]
+dev = [
+    "ruff",
+    "pytest",
+]
+
+[tool.ruff]
+# Lint the Python sources and tests. The Vulkan/HIP shader and C sources
+# are not Python and are ignored automatically.
+target-version = "py311"
+# A couple of pre-existing print/format lines run slightly long; keep the
+# limit permissive rather than reflowing untouched code.
+line-length = 130
+
+# Default ruff rule set (pyflakes F + a subset of pycodestyle E) is what the
+# project is linted against. Import-sorting (I) is intentionally left out so a
+# polish pass does not churn every import block.
+
+[tool.pytest.ini_options]
+# Only the pure-logic unit tests live under tests/. They avoid any heavy
+# dependency (torch/HIP/Vulkan) and run without a GPU.
+testpaths = ["tests"]
+addopts = "-q"

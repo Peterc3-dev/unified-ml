@@ -6,11 +6,9 @@ and provides ctypes hooks for the shared library (when built).
 """
 
 import subprocess
-import os
-import json
 import time
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 
 # Project root (assumes standard layout)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -118,7 +116,7 @@ class UnifiedML:
         with open(output_path, "w") as f:
             f.write("=" * 60 + "\n")
             f.write("  unified-ml Benchmark Results\n")
-            f.write(f"  Generated: {time.strftime(%Y-%m-%d %H:%M:%S)}\n")
+            f.write(f"  Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=" * 60 + "\n\n")
 
             for name, output in results.items():
